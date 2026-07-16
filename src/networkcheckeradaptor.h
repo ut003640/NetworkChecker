@@ -4,7 +4,7 @@
 #include <QtCore/QObject>
 #include <QtDBus/QtDBus>
 
-class NetworkChecker;
+class NetworkCheckerProxy;
 
 class NetworkCheckerAdaptor : public QDBusAbstractAdaptor
 {
@@ -14,19 +14,21 @@ class NetworkCheckerAdaptor : public QDBusAbstractAdaptor
         "  <interface name=\"org.deepin.demo.NetworkChecker\">\n"
         "    <method name=\"isOnline\">\n"
         "      <arg direction=\"in\" type=\"s\" name=\"interfacename\"/>\n"
+        "      <arg direction=\"in\" type=\"b\" name=\"byHostname\"/>\n"
         "      <arg direction=\"out\" type=\"b\" name=\"online\"/>\n"
         "    </method>\n"
         "  </interface>\n"
         "")
 
 public:
-    explicit NetworkCheckerAdaptor(NetworkChecker *parent);
+    explicit NetworkCheckerAdaptor(NetworkCheckerProxy *parent);
     virtual ~NetworkCheckerAdaptor();
 
-    NetworkChecker *parent() const;
-
 public Q_SLOTS:
-    bool isOnline(const QString &interfacename);
+    bool isOnline(const QString &interfacename, bool byHostname);
+
+private:
+    NetworkCheckerProxy *m_checkerProxy;
 };
 
 #endif

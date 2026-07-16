@@ -1,22 +1,19 @@
 #include "networkcheckeradaptor.h"
-#include "networkchecker.h"
+#include "networkcheckerbyip.h"
+#include "networkcheckerbydomain.h"
+#include "networkcheckerproxy.h"
 
-NetworkCheckerAdaptor::NetworkCheckerAdaptor(NetworkChecker *parent)
+NetworkCheckerAdaptor::NetworkCheckerAdaptor(NetworkCheckerProxy *parent)
     : QDBusAbstractAdaptor(parent)
+    , m_checkerProxy(parent)
 {
-    setAutoRelaySignals(true);
 }
 
 NetworkCheckerAdaptor::~NetworkCheckerAdaptor()
 {
 }
 
-NetworkChecker *NetworkCheckerAdaptor::parent() const
+bool NetworkCheckerAdaptor::isOnline(const QString &interfacename, bool byHostname)
 {
-    return static_cast<NetworkChecker *>(QObject::parent());
-}
-
-bool NetworkCheckerAdaptor::isOnline(const QString &interfacename)
-{
-    return parent()->isOnline(interfacename);
+    return m_checkerProxy->isOnline(interfacename, byHostname);
 }

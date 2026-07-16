@@ -12,9 +12,11 @@ public:
 public Q_SLOTS:
     bool isOnline(const QString &interfacename);
 
+protected:
+    virtual bool checkIfInterfaceOnline(const QString &interfacename) = 0;
+
 private:
     bool checkInterfaceExists(const QString &interfacename);
-    bool tcpCheckThroughInterface(const QString &interfacename, const QString &host);
 };
 
 #endif

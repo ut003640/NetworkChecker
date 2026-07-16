@@ -6,6 +6,7 @@
 
 #include "networkchecker.h"
 #include "networkcheckeradaptor.h"
+#include "networkcheckerproxy.h"
 
 static void signalHandler(int)
 {
@@ -28,14 +29,14 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    NetworkChecker checker;
-    if (!connection.registerObject("/", &checker)) {
+    NetworkCheckerProxy proxy;
+    if (!connection.registerObject("/", &proxy)) {
         qCritical() << "Failed to register DBus object:"
                      << connection.lastError().message();
         return 1;
     }
 
-    NetworkCheckerAdaptor adapter(&checker);
+    NetworkCheckerAdaptor adapter(&proxy);
     qDebug() << "NetworkChecker service started on system bus";
     return app.exec();
 }

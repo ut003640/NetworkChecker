@@ -12,6 +12,9 @@ add_executable(${PROJECT_NAME}
     src/main.cpp
     src/networkchecker.cpp
     src/networkcheckeradaptor.cpp
+    src/networkcheckerbydomain.cpp
+    src/networkcheckerbyip.cpp
+    src/networkcheckerproxy.cpp
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE
