@@ -1,0 +1,13 @@
+Source: networkchecker
+Section: libs
+Priority: optional
+Maintainer: Deepin Developer <developer@deepin.org>
+Build-Depends: debhelper-compat (= 12), cmake
+Standards-Version: 4.5.0
+
+Package: networkchecker
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: NetworkChecker DBus Service
+ A system service that provides a DBus interface to check whether
+ a specified network interface is online via TCP connect test.

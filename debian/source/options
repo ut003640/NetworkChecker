@@ -1,0 +1,11 @@
+extend-diff-ignore-README.md
+extend-diff-ignore-.gitignore
+extend-diff-ignore-.git/
+extend-diff-ignore-build/
+extend-diff-ignore-*.o
+extend-diff-ignore-*.moc
+extend-diff-ignore-Makefile
+extend-diff-ignore-cmake_install.cmake
+extend-diff-ignore-CMakeCache.txt
+extend-diff-ignore-CMakeFiles/
+extend-diff-ignore-NetworkChecker_autogen/

@@ -28,5 +28,10 @@ install(TARGETS ${PROJECT_NAME} DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 install(FILES
     org.deepin.demo.NetworkChecker.service
-    DESTINATION ${CMAKE_INSTALL_PREFIX}/lib/systemd/user
+    DESTINATION /lib/systemd/system
+)
+
+install(FILES
+    org.deepin.demo.NetworkChecker.conf
+    DESTINATION /etc/dbus-1/system.d
 )

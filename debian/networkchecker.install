@@ -1,0 +1,3 @@
+etc/dbus-1/system.d/org.deepin.demo.NetworkChecker.conf
+usr/bin/NetworkChecker
+lib/systemd/system/org.deepin.demo.NetworkChecker.service

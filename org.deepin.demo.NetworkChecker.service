@@ -1,12 +1,15 @@
 [Unit]
 Description=NetworkChecker DBus Service
-After=dbus.socket
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-Type=simple
+Type=dbus
+BusName=org.deepin.demo.NetworkChecker
 ExecStart=/usr/bin/NetworkChecker
 Restart=on-failure
 RestartSec=5
+User=root
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target

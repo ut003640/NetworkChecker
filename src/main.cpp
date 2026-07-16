@@ -20,7 +20,7 @@ int main(int argc, char *argv[])
     std::signal(SIGTERM, signalHandler);
     std::signal(SIGINT, signalHandler);
 
-    QDBusConnection connection = QDBusConnection::sessionBus();
+    QDBusConnection connection = QDBusConnection::systemBus();
     if (!connection.registerService("org.deepin.demo.NetworkChecker")) {
         qCritical() << "Failed to register DBus service:"
                      << connection.lastError().message();
@@ -34,6 +34,6 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    qDebug() << "NetworkChecker service started on session bus";
+    qDebug() << "NetworkChecker service started on system bus";
     return app.exec();
 }
