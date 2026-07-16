@@ -1,5 +1,4 @@
 #include "networkchecker.h"
-#include "networkcheckeradaptor.h"
 
 #include <sys/socket.h>
 #include <net/if.h>
@@ -21,7 +20,6 @@ static const QStringList kTestHosts = {
 NetworkChecker::NetworkChecker(QObject *parent)
     : QObject(parent)
 {
-    new NetworkCheckerAdaptor(this);
 }
 
 bool NetworkChecker::isOnline(const QString &interfacename)
@@ -61,7 +59,8 @@ bool NetworkChecker::checkInterfaceExists(const QString &interfacename)
 bool NetworkChecker::tcpCheckThroughInterface(const QString &interfacename, const QString &host)
 {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) return false;
+    if (sock < 0)
+        return false;
 
     struct ifreq ifr;
     memset(&ifr, 0, sizeof(ifr));
@@ -82,11 +81,11 @@ bool NetworkChecker::tcpCheckThroughInterface(const QString &interfacename, cons
     inet_pton(AF_INET, host.toStdString().c_str(), &target.sin_addr);
 
     int ret = ::connect(sock, (sockaddr *)&target, sizeof(target));
-    bool online = false;
 
-    if (ret == 0) {
-        online = true;
-    } else if (errno == EINPROGRESS) {
+    if (ret == 0)
+        return true;
+
+    if (errno == EINPROGRESS) {
         fd_set wfds;
         FD_ZERO(&wfds);
         FD_SET(sock, &wfds);
@@ -98,10 +97,10 @@ bool NetworkChecker::tcpCheckThroughInterface(const QString &interfacename, cons
             int err = 0;
             socklen_t len = sizeof(err);
             getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &len);
-            online = (err == 0);
+            return (err == 0);
         }
     }
 
     close(sock);
-    return online;
+    return false;
 }

@@ -5,6 +5,7 @@
 #include <csignal>
 
 #include "networkchecker.h"
+#include "networkcheckeradaptor.h"
 
 static void signalHandler(int)
 {
@@ -34,6 +35,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    NetworkCheckerAdaptor adapter(&checker);
     qDebug() << "NetworkChecker service started on system bus";
     return app.exec();
 }
