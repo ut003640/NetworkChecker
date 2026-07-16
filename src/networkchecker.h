@@ -14,8 +14,7 @@ public Q_SLOTS:
 
 private:
     bool checkInterfaceExists(const QString &interfacename);
-    bool pingThroughInterface(const QString &interfacename, const QString &host);
-    bool httpCheckThroughInterface(const QString &interfacename, const QString &url);
+    bool tcpCheckThroughInterface(const QString &interfacename, const QString &host);
 };
 
 #endif

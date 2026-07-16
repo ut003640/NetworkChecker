@@ -37,7 +37,7 @@ bool NetworkChecker::isOnline(const QString &interfacename)
     }
 
     for (const QString &host : kTestHosts) {
-        if (pingThroughInterface(interfacename, host)) {
+        if (tcpCheckThroughInterface(interfacename, host)) {
             qDebug() << "Interface" << interfacename << "is online via" << host;
             return true;
         }
@@ -58,61 +58,48 @@ bool NetworkChecker::checkInterfaceExists(const QString &interfacename)
     return false;
 }
 
-bool NetworkChecker::pingThroughInterface(const QString &interfacename, const QString &host)
+bool NetworkChecker::tcpCheckThroughInterface(const QString &interfacename, const QString &host)
 {
-    QProcess proc;
-    proc.setProcessChannelMode(QProcess::MergedChannels);
-    proc.start("ping", {"-I", interfacename, "-c", "1", "-W", "3", host});
-    proc.waitForFinished(5000);
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return false;
 
-    return proc.exitCode() == 0;
-}
-
-bool NetworkChecker::httpCheckThroughInterface(const QString &interfacename, const QString &url)
-{
-    // 1. 创建UDP socket（轻量，比TCP快）
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if(sock < 0) return false;
-
-    // 2. 设置非阻塞 + 超时
-    int flags = fcntl(sock, F_GETFL, 0);
-    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-
-    // 3. 绑定指定网卡核心：SO_BINDTODEVICE
     struct ifreq ifr;
     memset(&ifr, 0, sizeof(ifr));
-    strncpy(ifr.ifr_name, interfacename.toStdString().c_str(), IFNAMSIZ-1);
-    if(setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE, &ifr, sizeof(ifr)) < 0)
-    {
+    strncpy(ifr.ifr_name, interfacename.toStdString().c_str(), IFNAMSIZ - 1);
+    if (setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE, &ifr, sizeof(ifr)) < 0) {
         close(sock);
-        qWarning() << "绑定网卡失败" << interfacename << strerror(errno);
+        qWarning() << "bind device failed" << interfacename << strerror(errno);
         return false;
     }
 
-    // 4. 目标外网DNS：8.8.8.8 端口53
+    int flags = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+
     sockaddr_in target;
     memset(&target, 0, sizeof(target));
     target.sin_family = AF_INET;
     target.sin_port = htons(53);
-    inet_pton(AF_INET, "8.8.8.8", &target.sin_addr);
+    inet_pton(AF_INET, host.toStdString().c_str(), &target.sin_addr);
 
-    // 5. 发送空包测试连通路由
-    sendto(sock, "test", 4, MSG_NOSIGNAL, (sockaddr*)&target, sizeof(target));
-
-    // 6. select 超时等待回复
-    fd_set fds;
-    FD_ZERO(&fds);
-    FD_SET(sock, &fds);
-    timeval tv;
-    tv.tv_sec = 5;
-    tv.tv_usec = 500 * 1000;
-
+    int ret = ::connect(sock, (sockaddr *)&target, sizeof(target));
     bool online = false;
-    if(select(sock+1, &fds, nullptr, nullptr, &tv) > 0)
-    {
-        char buf[64];
-        if(recv(sock, buf, sizeof(buf), MSG_DONTWAIT) > 0)
-            online = true;
+
+    if (ret == 0) {
+        online = true;
+    } else if (errno == EINPROGRESS) {
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(sock, &wfds);
+        timeval tv;
+        tv.tv_sec = 5;
+        tv.tv_usec = 0;
+
+        if (select(sock + 1, nullptr, &wfds, nullptr, &tv) > 0) {
+            int err = 0;
+            socklen_t len = sizeof(err);
+            getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &len);
+            online = (err == 0);
+        }
     }
 
     close(sock);
