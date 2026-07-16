@@ -1,0 +1,10 @@
+<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+"http://www.freedesktop.org/software/dbus/1.0/dbus-spec.dtd">
+<node name="/">
+  <interface name="org.deepin.demo.NetworkChecker">
+    <method name="isOnline">
+      <arg name="interfacename" type="s" direction="in"/>
+      <arg name="online" type="b" direction="out"/>
+    </method>
+  </interface>
+</node>

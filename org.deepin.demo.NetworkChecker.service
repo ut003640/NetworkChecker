@@ -1,0 +1,12 @@
+[Unit]
+Description=NetworkChecker DBus Service
+After=dbus.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/NetworkChecker
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
