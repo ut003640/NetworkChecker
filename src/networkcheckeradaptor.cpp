@@ -17,3 +17,8 @@ bool NetworkCheckerAdaptor::isOnline(const QString &interfacename, bool byHostna
 {
     return m_checkerProxy->isOnline(interfacename, byHostname);
 }
+
+bool NetworkCheckerAdaptor::setPrimaryInterface(const QString &interfacename)
+{
+    return m_checkerProxy->setPrimaryInterface(interfacename);
+}

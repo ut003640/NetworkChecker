@@ -6,5 +6,9 @@
       <arg name="interfacename" type="s" direction="in"/>
       <arg name="online" type="b" direction="out"/>
     </method>
+    <method name="setPrimaryInterface">
+      <arg name="interfacename" type="s" direction="in"/>
+      <arg name="success" type="b" direction="out"/>
+    </method>
   </interface>
 </node>

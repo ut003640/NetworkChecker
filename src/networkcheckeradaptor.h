@@ -17,6 +17,10 @@ class NetworkCheckerAdaptor : public QDBusAbstractAdaptor
         "      <arg direction=\"in\" type=\"b\" name=\"byHostname\"/>\n"
         "      <arg direction=\"out\" type=\"b\" name=\"online\"/>\n"
         "    </method>\n"
+        "    <method name=\"setPrimaryInterface\">\n"
+        "      <arg direction=\"in\" type=\"s\" name=\"interfacename\"/>\n"
+        "      <arg direction=\"out\" type=\"b\" name=\"success\"/>\n"
+        "    </method>\n"
         "  </interface>\n"
         "")
 
@@ -26,6 +30,7 @@ public:
 
 public Q_SLOTS:
     bool isOnline(const QString &interfacename, bool byHostname);
+    bool setPrimaryInterface(const QString &interfacename);
 
 private:
     NetworkCheckerProxy *m_checkerProxy;
