@@ -2,7 +2,12 @@ Source: networkchecker
 Section: libs
 Priority: optional
 Maintainer: Deepin Developer <developer@deepin.org>
-Build-Depends: debhelper-compat (= 12), cmake
+Build-Depends: debhelper-compat (= 12),
+ cmake,
+ pkg-config,
+ qtbase5-dev,
+ libkf5networkmanagerqt-dev,
+ libnm-dev
 Standards-Version: 4.5.0
 
 Package: networkchecker
