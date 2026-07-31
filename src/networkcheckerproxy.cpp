@@ -10,6 +10,7 @@
 #include <NetworkManagerQt/Settings>
 #include <NetworkManagerQt/Ipv4Setting>
 #include <NetworkManagerQt/Ipv6Setting>
+#include <NetworkManagerQt/Device>
 
 NetworkCheckerProxy::NetworkCheckerProxy(QObject *parent)
     : QObject(parent)
@@ -26,90 +27,82 @@ bool NetworkCheckerProxy::isOnline(const QString &interfacename, bool byHostname
     return m_checker->isOnline(interfacename);
 }
 
-static quint32 defaultMetricForDeviceType(NetworkManager::Device::Type type)
+static NetworkManager::Device::List activeInterfaceNames()
 {
-    switch (type) {
-    case NetworkManager::Device::Ethernet:   return 100;
-    case NetworkManager::Device::Wifi:       return 600;
-    case NetworkManager::Device::Bond:       return 300;
-    case NetworkManager::Device::Team:       return 350;
-    case NetworkManager::Device::Vlan:       return 400;
-    case NetworkManager::Device::Bridge:     return 425;
-    case NetworkManager::Device::VxLan:      return 500;
-    case NetworkManager::Device::Modem:      return 700;
-    case NetworkManager::Device::Bluetooth:  return 750;
-    case NetworkManager::Device::Dummy:      return 550;
-    default:                                 return 950;
-    }
-}
-
-static QSet<QString> activeInterfaceNames()
-{
-    QSet<QString> result;
+    NetworkManager::Device::List result;
     NetworkManager::ActiveConnection::List activeConns = NetworkManager::activeConnections();
     for (const NetworkManager::ActiveConnection::Ptr &ac : activeConns) {
         if (ac->state() != NetworkManager::ActiveConnection::Activated)
             continue;
-        NetworkManager::Device::Ptr dev = ac->devices().isEmpty()
-            ? nullptr
-            : NetworkManager::findNetworkInterface(ac->devices().first());
-        if (dev)
-            result.insert(dev->interfaceName());
-    }
-    return result;
-}
-
-static QHash<QString, quint32> buildDeviceMetrics()
-{
-    QHash<QString, quint32> result;
-    NetworkManager::Device::List devices = NetworkManager::networkInterfaces();
-    for (const NetworkManager::Device::Ptr &dev : devices) {
-        result[dev->interfaceName()] = defaultMetricForDeviceType(dev->type());
+        NetworkManager::Device::Ptr dev = ac->devices().isEmpty() ? nullptr : NetworkManager::findNetworkInterface(ac->devices().first());
+        if (dev) {
+            result << dev;
+        }
     }
     return result;
 }
 
 bool NetworkCheckerProxy::setPrimaryInterface(const QString &interfacename)
 {
-    auto activeIfaces = activeInterfaceNames();
-    if (!activeIfaces.contains(interfacename)) {
+    NetworkManager::Device::List activeIfaces = activeInterfaceNames();
+    bool interfaceExist = false;
+    for (const NetworkManager::Device::Ptr &device : activeIfaces) {
+        if (device->interfaceName() == interfacename) {
+            interfaceExist = true;
+            break;
+        }
+    }
+    if (!interfaceExist) {
         qWarning() << "Interface not active:" << interfacename;
         return false;
     }
 
-    auto deviceMetrics = buildDeviceMetrics();
-    NetworkManager::Connection::List connections = NetworkManager::listConnections();
+    const quint32 primaryMetric = 100;
+    const quint32 secondaryMetric = 1000;
 
-    for (const NetworkManager::Connection::Ptr &conn : connections) {
+    QMap<QString, NMVariantMapMap> deviceSettings;
+    for (const NetworkManager::Device::Ptr &dev : activeIfaces) {
+        bool isTarget = (dev->interfaceName() == interfacename);
+        quint32 metric = isTarget ? primaryMetric : secondaryMetric;
+
+        auto ac = dev->activeConnection();
+        if (!ac || ac->state() != NetworkManager::ActiveConnection::Activated)
+            continue;
+
+        NetworkManager::Connection::Ptr conn = ac->connection();
         NetworkManager::ConnectionSettings::Ptr settings = conn->settings();
-        QString ifaceName = settings->interfaceName();
 
-        if (ifaceName.isEmpty())
-            continue;
-
-        bool isTarget = (ifaceName == interfacename);
-        if (!isTarget && !activeIfaces.contains(ifaceName))
-            continue;
-
-        quint32 metric = isTarget
-            ? deviceMetrics.value(ifaceName, 100)
-            : deviceMetrics.value(ifaceName, 950);
-
-        NetworkManager::Ipv4Setting::Ptr ipv4 = settings->setting(NetworkManager::Setting::Ipv4)
-            .staticCast<NetworkManager::Ipv4Setting>();
+        bool needReapply = false;
+        NetworkManager::Ipv4Setting::Ptr ipv4 = settings->setting(NetworkManager::Setting::Ipv4).staticCast<NetworkManager::Ipv4Setting>();
         if (ipv4) {
             ipv4->setRouteMetric(metric);
             ipv4->setInitialized(true);
+            needReapply = true;
         }
 
-        NetworkManager::Ipv6Setting::Ptr ipv6 = settings->setting(NetworkManager::Setting::Ipv6)
-            .staticCast<NetworkManager::Ipv6Setting>();
+        NetworkManager::Ipv6Setting::Ptr ipv6 = settings->setting(NetworkManager::Setting::Ipv6).staticCast<NetworkManager::Ipv6Setting>();
         if (ipv6) {
             ipv6->setRouteMetric(metric);
             ipv6->setInitialized(true);
+            needReapply = true;
         }
 
         conn->update(settings->toMap());
+        if (needReapply) {
+            deviceSettings[dev->uni()] = conn->settings()->toMap();
+        }
+    }
+
+    for (auto it = deviceSettings.begin(); it != deviceSettings.end(); it++) {
+        const QString path = it.key();
+        const NMVariantMapMap settingMap = it.value();
+        QDBusInterface dbusIface("org.freedesktop.NetworkManager", path, "org.freedesktop.NetworkManager.Device", QDBusConnection::systemBus());
+        QDBusMessage reply = dbusIface.call("Reapply", QVariant::fromValue(settingMap), QVariant::fromValue(static_cast<quint64>(0)), QVariant::fromValue(static_cast<quint32>(0)));
+        if (reply.type() == QDBusMessage::ErrorMessage) {
+            qWarning() << "Reapply failed for device" << path << "error:" << reply.errorMessage();
+            return false;
+         }
+         qInfo() << "Set device" << path << "setting:" << settingMap << " metric success";
     }
 
     return true;
