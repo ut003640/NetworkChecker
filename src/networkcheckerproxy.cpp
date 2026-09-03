@@ -27,26 +27,12 @@ bool NetworkCheckerProxy::isOnline(const QString &interfacename, bool byHostname
     return m_checker->isOnline(interfacename);
 }
 
-static NetworkManager::Device::List activeInterfaceNames()
-{
-    NetworkManager::Device::List result;
-    NetworkManager::ActiveConnection::List activeConns = NetworkManager::activeConnections();
-    for (const NetworkManager::ActiveConnection::Ptr &ac : activeConns) {
-        if (ac->state() != NetworkManager::ActiveConnection::Activated)
-            continue;
-        NetworkManager::Device::Ptr dev = ac->devices().isEmpty() ? nullptr : NetworkManager::findNetworkInterface(ac->devices().first());
-        if (dev) {
-            result << dev;
-        }
-    }
-    return result;
-}
-
 bool NetworkCheckerProxy::setPrimaryInterface(const QString &interfacename)
 {
     const NetworkManager::Device::List &allDevices = NetworkManager::networkInterfaces();
     const quint32 primaryMetric = 100;
     const quint32 secondaryMetric = 1000;
+    bool targetFound = false;
     QMap<QString, NMVariantMapMap> deviceSettings;
     for (const NetworkManager::Device::Ptr &dev : allDevices) {
         // 跳过没有活跃连接的网卡
@@ -58,6 +44,9 @@ bool NetworkCheckerProxy::setPrimaryInterface(const QString &interfacename)
             continue;
 
         bool isTarget = (dev->interfaceName() == interfacename);
+        if (isTarget)
+            targetFound = true;
+
         quint32 metric = isTarget ? primaryMetric : secondaryMetric;
 
         NetworkManager::Connection::Ptr conn = ac->connection();
@@ -79,9 +68,13 @@ bool NetworkCheckerProxy::setPrimaryInterface(const QString &interfacename)
         }
 
         if (needReapply) {
-            conn->update(settings->toMap());
-            deviceSettings[dev->uni()] = conn->settings()->toMap();
+            deviceSettings[dev->uni()] = settings->toMap();
         }
+    }
+
+    if (!targetFound) {
+        qWarning() << "target interface not found or not active:" << interfacename;
+        return false;
     }
 
     if (deviceSettings.isEmpty()) {

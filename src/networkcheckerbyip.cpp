@@ -58,12 +58,17 @@ bool NetworkCheckerByIp::tcpCheckThroughInterface(const QString &interfacename, 
     memset(&target, 0, sizeof(target));
     target.sin_family = AF_INET;
     target.sin_port = htons(53);
-    inet_pton(AF_INET, host.toStdString().c_str(), &target.sin_addr);
+    if (inet_pton(AF_INET, host.toStdString().c_str(), &target.sin_addr) != 1) {
+        close(sock);
+        return false;
+    }
 
     int ret = ::connect(sock, (sockaddr *)&target, sizeof(target));
 
-    if (ret == 0)
+    if (ret == 0) {
+        close(sock);
         return true;
+    }
 
     if (errno == EINPROGRESS) {
         fd_set wfds;
@@ -77,6 +82,7 @@ bool NetworkCheckerByIp::tcpCheckThroughInterface(const QString &interfacename, 
             int err = 0;
             socklen_t len = sizeof(err);
             getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &len);
+            close(sock);
             return (err == 0);
         }
     }

@@ -4,6 +4,7 @@
   <interface name="org.deepin.demo.NetworkChecker">
     <method name="isOnline">
       <arg name="interfacename" type="s" direction="in"/>
+      <arg name="byHostname" type="b" direction="in"/>
       <arg name="online" type="b" direction="out"/>
     </method>
     <method name="setPrimaryInterface">

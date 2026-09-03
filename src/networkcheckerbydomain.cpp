@@ -1,26 +1,11 @@
 #include "networkcheckerbydomain.h"
 
-#include <sys/socket.h>
 #include <net/if.h>
 #include <arpa/inet.h>
-#include <unistd.h>
 #include <fcntl.h>
-#include <errno.h>
-
-#include <netinet/in.h>
-#include <cstring>
 #include <netdb.h>
-#include <chrono>
 
-#include <QNetworkInterface>
 #include <NetworkManagerQt/Manager>
-#include <NetworkManagerQt/Device>
-#include <NetworkManagerQt/IpConfig>
-
-#include <QDebug>
-#include <QFile>
-#include <QTextStream>
-#include <QRegularExpression>
 
 static const QStringList kTestHosts = {
     "http://www.baidu.com",
@@ -65,10 +50,13 @@ bool NetworkCheckerByDomain::checkIfInterfaceOnline(const QString &interfacename
 
         int curTimeout = qMin(perUrlTimeout, remainTimeout);
         QString host = url;
+        quint16 port = 80;
         static QStringList schemePrefixes = {"https://", "http://"};
         for (const QString &prefix : schemePrefixes) {
             if (host.startsWith(prefix)) {
                 host = host.remove(0, prefix.length());
+                if (prefix.startsWith("https"))
+                    port = 443;
                 break;
             }
         }
@@ -77,7 +65,9 @@ bool NetworkCheckerByDomain::checkIfInterfaceOnline(const QString &interfacename
         }
         in_addr addr;
         if (inet_pton(AF_INET, host.toStdString().c_str(), &addr) == 1) {
-            QString remoteIp = QString::fromLatin1(inet_ntoa(addr));
+            char addrBuf[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &addr, addrBuf, sizeof(addrBuf));
+            QString remoteIp = QString::fromLatin1(addrBuf);
             if (remoteAddrs.contains(remoteIp))
                 continue;
 
@@ -85,13 +75,13 @@ bool NetworkCheckerByDomain::checkIfInterfaceOnline(const QString &interfacename
             sockaddr_in target {};
             memset(&target, 0, sizeof(target));
             target.sin_family = AF_INET;
-            target.sin_port = htons(80);
+            target.sin_port = htons(port);
             target.sin_addr = addr;
             if (isIfaceReachable(device->interfaceName(), target, curTimeout)) {
                 qDebug() << "interface " << device->interfaceName() << " test ip " << url << " ok";
                 return true;
             }
-        } else if (checkNetCardOnline(device, host, dnsList, curTimeout)) {
+        } else if (checkNetCardOnline(device, host, dnsList, curTimeout, port)) {
             // 如果是域名，先通过指定网卡的 DNS 解析域名，再 TCP 连接解析出的 IP
             qDebug() << "interface " << device->interfaceName() << " test url " << url << " ok";
             return true;
@@ -193,7 +183,7 @@ bool NetworkCheckerByDomain::isIfaceReachable(const QString &ifName, const socka
     return false;
 }
 
-bool NetworkCheckerByDomain::checkNetCardOnline(const NetworkManager::Device::Ptr &device, const QString &domain, const QStringList &dnslist, int timeoutMs) const
+bool NetworkCheckerByDomain::checkNetCardOnline(const NetworkManager::Device::Ptr &device, const QString &domain, const QStringList &dnslist, int timeoutMs, int port) const
 {
     in_addr targetIp{};
     QElapsedTimer elapsed;
@@ -209,7 +199,7 @@ bool NetworkCheckerByDomain::checkNetCardOnline(const NetworkManager::Device::Pt
     sockaddr_in dest{};
     memset(&dest, 0, sizeof(dest));
     dest.sin_family = AF_INET;
-    dest.sin_port = htons(80);
+    dest.sin_port = htons(static_cast<quint16>(port));
     dest.sin_addr = targetIp;
 
     return isIfaceReachable(device->interfaceName(), dest, remainTimeout);

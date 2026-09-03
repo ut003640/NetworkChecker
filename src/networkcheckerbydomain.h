@@ -3,10 +3,6 @@
 
 #include "networkchecker.h"
 
-#include <sys/socket.h>
-#include <net/if.h>
-#include <arpa/inet.h>
-
 #include <NetworkManagerQt/Device>
 
 class NetworkCheckerByDomain : public NetworkChecker
@@ -22,7 +18,7 @@ protected:
 private:
     QStringList getDeviceDnsList(const NetworkManager::Device::Ptr &device) const;
     bool isIfaceReachable(const QString &ifName, const sockaddr_in &dest, int timeoutMs) const;
-    bool checkNetCardOnline(const NetworkManager::Device::Ptr &device, const QString &domain, const QStringList &dnslist, int timeoutMs) const;
+    bool checkNetCardOnline(const NetworkManager::Device::Ptr &device, const QString &domain, const QStringList &dnslist, int timeoutMs, int port) const;
     bool resolveByBindIface(const NetworkManager::Device::Ptr &device, const QString &domain, const QStringList &dnslist, in_addr &outIp, int timeout) const;
     bool checkIpAddrByUDP(const NetworkManager::Device::Ptr &device, const QString &dnsIp, const QString &domain, int curTimeout, in_addr &outIp) const;
     bool checkIpAddrByTCP(const NetworkManager::Device::Ptr &device, const QString &dnsIp, const QString &domain, int curTimeout, in_addr &outIp) const;
