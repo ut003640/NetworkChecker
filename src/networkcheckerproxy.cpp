@@ -44,30 +44,21 @@ static NetworkManager::Device::List activeInterfaceNames()
 
 bool NetworkCheckerProxy::setPrimaryInterface(const QString &interfacename)
 {
-    NetworkManager::Device::List activeIfaces = activeInterfaceNames();
-    bool interfaceExist = false;
-    for (const NetworkManager::Device::Ptr &device : activeIfaces) {
-        if (device->interfaceName() == interfacename) {
-            interfaceExist = true;
-            break;
-        }
-    }
-    if (!interfaceExist) {
-        qWarning() << "Interface not active:" << interfacename;
-        return false;
-    }
-
+    const NetworkManager::Device::List &allDevices = NetworkManager::networkInterfaces();
     const quint32 primaryMetric = 100;
     const quint32 secondaryMetric = 1000;
-
     QMap<QString, NMVariantMapMap> deviceSettings;
-    for (const NetworkManager::Device::Ptr &dev : activeIfaces) {
-        bool isTarget = (dev->interfaceName() == interfacename);
-        quint32 metric = isTarget ? primaryMetric : secondaryMetric;
+    for (const NetworkManager::Device::Ptr &dev : allDevices) {
+        // 跳过没有活跃连接的网卡
+        if (dev->activeConnection().isNull())
+            continue;
 
         auto ac = dev->activeConnection();
         if (!ac || ac->state() != NetworkManager::ActiveConnection::Activated)
             continue;
+
+        bool isTarget = (dev->interfaceName() == interfacename);
+        quint32 metric = isTarget ? primaryMetric : secondaryMetric;
 
         NetworkManager::Connection::Ptr conn = ac->connection();
         NetworkManager::ConnectionSettings::Ptr settings = conn->settings();
@@ -87,22 +78,28 @@ bool NetworkCheckerProxy::setPrimaryInterface(const QString &interfacename)
             needReapply = true;
         }
 
-        conn->update(settings->toMap());
         if (needReapply) {
+            conn->update(settings->toMap());
             deviceSettings[dev->uni()] = conn->settings()->toMap();
         }
     }
 
-    for (auto it = deviceSettings.begin(); it != deviceSettings.end(); it++) {
-        const QString path = it.key();
-        const NMVariantMapMap settingMap = it.value();
+    if (deviceSettings.isEmpty()) {
+        qWarning() << "can't find device for change route";
+        return false;
+    }
+
+    // 通过 D-Bus 调用 Reapply 使修改的路由 metric 生效
+    // Reapply 签名: (a{sa{sv}}tu) — settings_map, version_id(0), flags(0)
+    for (auto it = deviceSettings.constBegin(); it != deviceSettings.constEnd(); ++it) {
+        const QString &path = it.key();
+        const NMVariantMapMap &settingMap = it.value();
         QDBusInterface dbusIface("org.freedesktop.NetworkManager", path, "org.freedesktop.NetworkManager.Device", QDBusConnection::systemBus());
         QDBusMessage reply = dbusIface.call("Reapply", QVariant::fromValue(settingMap), QVariant::fromValue(static_cast<quint64>(0)), QVariant::fromValue(static_cast<quint32>(0)));
         if (reply.type() == QDBusMessage::ErrorMessage) {
             qWarning() << "Reapply failed for device" << path << "error:" << reply.errorMessage();
             return false;
-         }
-         qInfo() << "Set device" << path << "setting:" << settingMap << " metric success";
+        }
     }
 
     return true;

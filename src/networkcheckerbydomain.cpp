@@ -23,8 +23,8 @@
 #include <QRegularExpression>
 
 static const QStringList kTestHosts = {
+    "http://www.baidu.com",
     "https://223.5.5.5",
-    "http://detect.uniontech.com",
 };
 
 NetworkCheckerByDomain::NetworkCheckerByDomain(QObject *parent)
@@ -34,23 +34,41 @@ NetworkCheckerByDomain::NetworkCheckerByDomain(QObject *parent)
 
 bool NetworkCheckerByDomain::checkIfInterfaceOnline(const QString &interfacename)
 {
-    auto routes = loadRoutesForIf(interfacename);
-
-    if (!hasDefaultRoute(routes))
+    NetworkManager::Device::Ptr device;
+    NetworkManager::Device::List all_devices = NetworkManager::networkInterfaces();
+    for (NetworkManager::Device::Ptr curr_device : all_devices) {
+        if (curr_device->interfaceName() == interfacename) {
+            device = curr_device;
+            break;
+        }
+    }
+    if (device.isNull())
         return false;
 
-    QStringList dnslist = getSysDnsList(interfacename);
-    if (dnslist.isEmpty())
+    QStringList dnsList = getDeviceDnsList(device);
+    if (dnsList.isEmpty()) {
+        qWarning() << "interface " << device->interfaceName() << " doesn't have dns";
         return false;
+    }
 
-    QStringList remote_addr;
-    static const int timeout = 3000;
-    for (const QString &hostname : kTestHosts) {
-        QString host = hostname;
-        static QStringList headers = {"https://", "http://"};
-        for (const QString &current_header : headers) {
-            if (host.startsWith(current_header)) {
-                host = host.remove(0, current_header.length());
+    const int totalTimeout = 10 * 1000;
+    QElapsedTimer totalElapsed;
+    totalElapsed.start();
+
+    QStringList remoteAddrs;
+    QStringList networkUrls = kTestHosts;
+    int perUrlTimeout = qMax(totalTimeout / qMax(networkUrls.size(), 1), 1000);
+    for (const QString &url : networkUrls) {
+        int remainTimeout = totalTimeout - static_cast<int>(totalElapsed.elapsed());
+        if (remainTimeout <= 0)
+            break;
+
+        int curTimeout = qMin(perUrlTimeout, remainTimeout);
+        QString host = url;
+        static QStringList schemePrefixes = {"https://", "http://"};
+        for (const QString &prefix : schemePrefixes) {
+            if (host.startsWith(prefix)) {
+                host = host.remove(0, prefix.length());
                 break;
             }
         }
@@ -59,175 +77,79 @@ bool NetworkCheckerByDomain::checkIfInterfaceOnline(const QString &interfacename
         }
         in_addr addr;
         if (inet_pton(AF_INET, host.toStdString().c_str(), &addr) == 1) {
-            const QString &remote_ip = QString::fromLatin1(inet_ntoa(addr));
-            if (remote_addr.contains(remote_ip))
+            QString remoteIp = QString::fromLatin1(inet_ntoa(addr));
+            if (remoteAddrs.contains(remoteIp))
                 continue;
 
-            remote_addr << remote_ip;
-            // 如果是IP地址，直接走IP地址检测
-            sockaddr_in target;
+            remoteAddrs << remoteIp;
+            sockaddr_in target {};
             memset(&target, 0, sizeof(target));
             target.sin_family = AF_INET;
             target.sin_port = htons(80);
             target.sin_addr = addr;
-            if (isIfaceReachable(interfacename, target, timeout)) {
+            if (isIfaceReachable(device->interfaceName(), target, curTimeout)) {
+                qDebug() << "interface " << device->interfaceName() << " test ip " << url << " ok";
                 return true;
             }
-        } else if (checkNetCardOnline(interfacename, host, dnslist, timeout, routes)) {
-            // 如果是域名，就走域名检测
+        } else if (checkNetCardOnline(device, host, dnsList, curTimeout)) {
+            // 如果是域名，先通过指定网卡的 DNS 解析域名，再 TCP 连接解析出的 IP
+            qDebug() << "interface " << device->interfaceName() << " test url " << url << " ok";
             return true;
         }
     }
+    // 兜底方案：直接 TCP 连接公共 DNS 的 80 端口，检测网卡是否有基本出口连通性（在一些网络结构中例如手机热点，可能屏蔽了53端口，通过DNS获取IP失败，这里就使用兜底方案）
+    static QStringList fallbackDnsList {"223.5.5.5", "223.6.6.6", "114.114.114.114", "8.8.8.8"};
+    for (const QString &dns : fallbackDnsList) {
+        int remainTimeout = totalTimeout - static_cast<int>(totalElapsed.elapsed());
+        if (remainTimeout <= 0)
+            break;
 
-    // 如果以上都无法检测网络是通的，就用兜底方案，直接检测公用的DNS
-    static QStringList avalible_dns {"223.5.5.5", "223.6.6.6", "114.114.114.114", "8.8.8.8"};
-    for (const QString &dns : avalible_dns) {
-        if (remote_addr.contains(dns))
+        if (remoteAddrs.contains(dns))
             continue;
 
-        sockaddr_in target;
+        int curTimeout = qMin(1000, remainTimeout);
+        sockaddr_in target {};
         memset(&target, 0, sizeof(target));
         target.sin_family = AF_INET;
         target.sin_port = htons(80);
         inet_pton(AF_INET, dns.toStdString().c_str(), &target.sin_addr);
-        if (isIfaceReachable(interfacename, target, 1000)) {
+        if (isIfaceReachable(device->interfaceName(), target, curTimeout)) {
+            qDebug() << "interface " << device->interfaceName() << "test dns " << dns << " ok";
             return true;
         }
     }
+    qDebug() << "interface " << device->interfaceName() << " is offline";
     return false;
 }
 
-bool NetworkCheckerByDomain::checkNetCardOnline(const QString &ifName, const QString &domain, const QStringList dnslist, int timeoutMs, const QList<QPair<uint32_t, uint32_t>> &routes)
+QStringList NetworkCheckerByDomain::getDeviceDnsList(const NetworkManager::Device::Ptr &device) const
 {
-    in_addr targetIp;
-    if (!resolveByBindIface(ifName, domain, dnslist, targetIp, timeoutMs))
-        return false;
-
-    sockaddr_in dest;
-    memset(&dest,0,sizeof(dest));
-    dest.sin_family = AF_INET;
-    dest.sin_port = htons(80);
-    dest.sin_addr = targetIp;
-
-    return isIfaceReachable(ifName, dest, timeoutMs);
-}
-
-bool NetworkCheckerByDomain::isRouteViaIf(uint32_t targetIp, const QList<QPair<uint32_t, uint32_t>> &routes)
-{
-#ifdef QT_DEBUG
-    char destStr[INET_ADDRSTRLEN], maskStr[INET_ADDRSTRLEN], targetStr[INET_ADDRSTRLEN];
-    in_addr addr;
-#endif
-    for (const auto &route : routes) {
-#ifdef QT_DEBUG
-        addr.s_addr = route.first;
-        inet_ntop(AF_INET, &addr, destStr, sizeof(destStr));
-        addr.s_addr = route.second;
-        inet_ntop(AF_INET, &addr, maskStr, sizeof(maskStr));
-        addr.s_addr = targetIp;
-        inet_ntop(AF_INET, &addr, targetStr, sizeof(targetStr));
-        qDebug() << "route dest:" << destStr << "mask:" << maskStr << "target:" << targetStr;
-#endif
-        if ((targetIp & route.second) == route.first)
-            return true;
+    NetworkManager::ActiveConnection::Ptr activeConnection = device->activeConnection();
+    if (activeConnection.isNull()) {
+        return {};
     }
-    return false;
-}
 
-QList<QPair<uint32_t, uint32_t>> NetworkCheckerByDomain::loadRoutesForIf(const QString &ifName)
-{
-    QList<QPair<uint32_t, uint32_t>> routes;
-    QFile f("/proc/net/route");
-    if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
-        return routes;
-
-    QTextStream in(&f);
-    in.readLine();
-    while (!in.atEnd()) {
-        QString line = in.readLine();
-        QStringList fields = line.split(QChar('\t'));
-        if (fields.size() < 8 || fields[0] != ifName)
-            continue;
-
-        bool ok = false;
-        uint32_t dest = fields[1].toUInt(&ok, 16);
-        if (!ok) continue;
-        uint32_t mask = fields[7].toUInt(&ok, 16);
-        if (!ok) continue;
-
-        routes.append({htonl(dest), htonl(mask)});
-    }
-    return routes;
-}
-
-bool NetworkCheckerByDomain::hasDefaultRoute(const QList<QPair<uint32_t, uint32_t>> &routes)
-{
-    for (const auto &route : routes) {
-        if (route.first == 0 && route.second == 0)
-            return true;
-    }
-    return false;
-}
-
-QStringList NetworkCheckerByDomain::getSysDnsList() const
-{
     QStringList dnsList;
-    QFile file("/etc/resolv.conf");
-    if (file.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        QRegularExpression reg("^nameserver\\s+(\\d+\\.\\d+\\.\\d+\\.\\d+)");
-        while (!file.atEnd()) {
-            QString line = file.readLine().trimmed();
-            QRegularExpressionMatch match = reg.match(line);
-            if (match.hasMatch()) {
-                dnsList << match.captured(1);
-            }
+    NetworkManager::IpConfig config = activeConnection->ipV4Config();
+    QList<QHostAddress> addresses = config.nameservers();
+    for (const QHostAddress &address : addresses) {
+        QString ip = address.toString();
+        if (!ip.isEmpty() && !dnsList.contains(ip)) {
+            dnsList << ip;
         }
-        file.close();
     }
+
     return dnsList;
 }
 
-QStringList NetworkCheckerByDomain::getSysDnsList(const QString &interface) const
+bool NetworkCheckerByDomain::isIfaceReachable(const QString &ifName, const sockaddr_in &dest, int timeoutMs) const
 {
-    NetworkManager::Device::Ptr device;
-    NetworkManager::Device::List deviceList = NetworkManager::networkInterfaces();
-    for (const NetworkManager::Device::Ptr &d: deviceList) {
-        QString ifname = d->interfaceName();
-        if (ifname == interface) {
-            device = d;
-            break;
-        }
-    }
-
-    if (device.isNull())
-        return QStringList();
-
-    NetworkManager::ActiveConnection::Ptr activeConnection = device->activeConnection();
-    if (activeConnection.isNull())
-        return QStringList();
-
-    QStringList allDns;
-    NetworkManager::IpConfig config = activeConnection->ipV4Config();
-    QList<QHostAddress> nameServers = config.nameservers();
-    for (const QHostAddress &host : nameServers) {
-        QString ip = host.toString();
-        if (!allDns.contains(ip))
-            allDns << ip;
-    }
-
-    return allDns;
-}
-
-bool NetworkCheckerByDomain::isIfaceReachable(const QString &ifName, const sockaddr_in &dest, const int &timeoutMs) const
-{
-    // 1. 创建TCP socket
-    int sockFd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-    if (sockFd < 0) {
+    int sockFd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockFd < 0)
         return false;
-    }
 
-    // 2. 强制绑定网卡设备，所有流量从该网卡发出
-    struct ifreq ifr;
+    // 绑定网卡设备，所有流量从该网卡发出
+    struct ifreq ifr{};
     memset(&ifr, 0, sizeof(ifr));
     strncpy(ifr.ifr_name, ifName.toStdString().c_str(), IFNAMSIZ - 1);
     if (setsockopt(sockFd, SOL_SOCKET, SO_BINDTODEVICE, &ifr, sizeof(ifr)) < 0) {
@@ -235,122 +157,163 @@ bool NetworkCheckerByDomain::isIfaceReachable(const QString &ifName, const socka
         return false;
     }
 
-    int ret = ::connect(sockFd, (sockaddr*)&dest, sizeof(dest));
-    if(ret == 0) {
+    // 设为非阻塞，用 select 控制连接超时
+    int flags = fcntl(sockFd, F_GETFL, 0);
+    fcntl(sockFd, F_SETFL, flags | O_NONBLOCK);
+
+    int connectRet = ::connect(sockFd, (sockaddr*)&dest, sizeof(dest));
+    if (connectRet < 0 && errno != EINPROGRESS) {
+        close(sockFd);
+        return false;
+    }
+
+    // 立即连接成功的情况
+    if (connectRet == 0) {
         close(sockFd);
         return true;
     }
-    if (errno == EINPROGRESS) {
-        fd_set wfds;
-        FD_ZERO(&wfds);
-        FD_SET(sockFd, &wfds);
-        timeval tv;
-        tv.tv_sec = timeoutMs / 1000;
-        tv.tv_usec = (timeoutMs % 1000) * 1000;
 
-        int selRet = select(sockFd + 1, nullptr, &wfds, nullptr, &tv);
-        if (selRet > 0) {
-            // 检查是否连接成功
-            int err = 0;
-            socklen_t errLen = sizeof(err);
-            getsockopt(sockFd, SOL_SOCKET, SO_ERROR, &err, &errLen);
-            close(sockFd);
-            return (err == 0);
-        }
+    // 等待连接完成（非阻塞模式下 EINPROGRESS 需要通过 select 检测可写事件）
+    fd_set wfds{};
+    FD_ZERO(&wfds);
+    FD_SET(sockFd, &wfds);
+    timeval tv{};
+    tv.tv_sec = timeoutMs / 1000;
+    tv.tv_usec = (timeoutMs % 1000) * 1000;
+    int selRet = select(sockFd + 1, nullptr, &wfds, nullptr, &tv);
+    if (selRet > 0) {
+        // 检查连接是否真正成功（select 可写不代表连接成功，需通过 SO_ERROR 确认）
+        int err = 0;
+        socklen_t errLen = sizeof(err);
+        getsockopt(sockFd, SOL_SOCKET, SO_ERROR, &err, &errLen);
+        close(sockFd);
+        return (err == 0);
     }
     close(sockFd);
     return false;
 }
 
-bool NetworkCheckerByDomain::resolveByBindIface(const QString &ifName, const QString &domain, const QStringList dnslist, in_addr &outIp, int timeout)
+bool NetworkCheckerByDomain::checkNetCardOnline(const NetworkManager::Device::Ptr &device, const QString &domain, const QStringList &dnslist, int timeoutMs) const
 {
-    bool succ = false;
-    int perDnsTimeout = qMax(timeout / qMax(dnslist.size(), 1), 1000);
-    int remainTimeout = timeout;
+    in_addr targetIp{};
+    QElapsedTimer elapsed;
+    elapsed.start();
+    int halfTimeout = timeoutMs / 2;
+    if (!resolveByBindIface(device, domain, dnslist, targetIp, halfTimeout))
+        return false;
 
-    // 优先使用UDP的方式来检测
-    for (const QString &dnsIp : dnslist) {
-        if (succ || remainTimeout <= 0)
-            break;
+    int remainTimeout = timeoutMs - static_cast<int>(elapsed.elapsed());
+    if (remainTimeout <= 0)
+        return false;
 
-        if (checkIpAddrByUDP(ifName, dnsIp, domain, qMin(perDnsTimeout, remainTimeout), outIp)) {
-            succ = true;
-            break;
-        }
-    }
+    sockaddr_in dest{};
+    memset(&dest, 0, sizeof(dest));
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons(80);
+    dest.sin_addr = targetIp;
 
-    if (!succ) {
-        // 如果以上使用UDP的方式没有检测成功，再次使用TCP的方式，因为如果连接的是手机热点，可能是因为53端口被系统策略给屏蔽了，此时再使用TCP的方式来检测
-        for (const QString &dnsIp : dnslist) {
-            if (succ || remainTimeout <= 0)
-                break;
-
-            if (checkIpAddrByTCP(ifName, dnsIp, domain, qMin(perDnsTimeout, remainTimeout), outIp)) {
-                succ = true;
-                break;
-            }
-        }
-    }
-
-    if (!succ) {
-        struct addrinfo hints, *res = nullptr;
-        memset(&hints, 0, sizeof(hints));
-        hints.ai_family = AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-
-        int gaiRet = getaddrinfo(domain.toStdString().c_str(), nullptr, &hints, &res);
-        if (gaiRet == 0 && res != nullptr) {
-            for (struct addrinfo *p = res; p != nullptr; p = p->ai_next) {
-                if (p->ai_family == AF_INET) {
-                    outIp = ((struct sockaddr_in *)p->ai_addr)->sin_addr;
-                    freeaddrinfo(res);
-                    return true;
-                }
-            }
-            freeaddrinfo(res);
-        }
-    }
-    return succ;
+    return isIfaceReachable(device->interfaceName(), dest, remainTimeout);
 }
 
-bool NetworkCheckerByDomain::checkIpAddrByUDP(const QString& ifName, const QString &dnsIp, const QString& domain, int curTimeout, in_addr &outIp) const
+// 绑定指定网卡进行 DNS 解析，按优先级依次尝试三种方式：
+// 1. UDP DNS 查询（常规方式）
+// 2. TCP DNS 查询（UDP 53 端口被屏蔽时的 fallback，如手机热点场景）
+// 3. 系统 getaddrinfo（兜底方案，使用系统默认路由解析）
+bool NetworkCheckerByDomain::resolveByBindIface(const NetworkManager::Device::Ptr &device, const QString &domain, const QStringList &dnslist, in_addr &outIp, int timeout) const
+{
+    // 将总超时平均分配给每个 DNS 服务器，每个至少 1 秒
+    int perDnsTimeout = qMax(timeout / qMax(dnslist.size(), 1), 1000);
+    int remainTimeout = timeout;
+    QElapsedTimer elapsed;
+    elapsed.start();
+
+    // 第一步：通过 UDP 方式向各 DNS 服务器发送 A 记录查询
+    for (const QString &dnsIp : dnslist) {
+        if (remainTimeout <= 0)
+            break;
+
+        int curTimeout = qMin(perDnsTimeout, remainTimeout);
+        if (checkIpAddrByUDP(device, dnsIp, domain, curTimeout, outIp)) {
+            qDebug() << "check dns success by step 1, elapse time: " << elapsed.elapsed() << "seconds";
+            return true;
+        }
+        remainTimeout -= elapsed.elapsed();
+        elapsed.restart();
+    }
+
+    // 第二步：如果 UDP 方式全部失败，改用 TCP 方式重试。
+    // 适用场景：连接手机热点时，运营商可能屏蔽 UDP 53 端口，但 TCP 53 端口可用
+    for (const QString &dnsIp : dnslist) {
+        if (remainTimeout <= 0)
+            break;
+
+        int curTimeout = qMin(perDnsTimeout, remainTimeout);
+        if (checkIpAddrByTCP(device, dnsIp, domain, curTimeout, outIp)) {
+            qDebug() << "check dns success by step 2, elapse time: " << elapsed.elapsed() << "seconds";
+            return true;
+        }
+        remainTimeout -= elapsed.elapsed();
+        elapsed.restart();
+    }
+
+    // 第三步：兜底方案，使用系统 getaddrinfo 解析（走系统默认路由，不绑定网卡）
+    struct addrinfo hints{}, *res = nullptr;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    int gaiRet = getaddrinfo(domain.toStdString().c_str(), nullptr, &hints, &res);
+    if (gaiRet == 0 && res != nullptr) {
+        for (struct addrinfo *p = res; p != nullptr; p = p->ai_next) {
+            if (p->ai_family == AF_INET) {
+                outIp = ((struct sockaddr_in *)p->ai_addr)->sin_addr;
+                freeaddrinfo(res);
+                qDebug() << "search dns success by step 3, elapse time: " << elapsed.elapsed() << "seconds";
+                return true;
+            }
+        }
+        freeaddrinfo(res);
+    }
+
+    return false;
+}
+
+bool NetworkCheckerByDomain::checkIpAddrByUDP(const NetworkManager::Device::Ptr &device, const QString &dnsIp, const QString &domain, int curTimeout, in_addr &outIp) const
 {
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0)
         return false;
 
-    struct ifreq ifr;
+    // 绑定网卡设备
+    struct ifreq ifr{};
     memset(&ifr, 0, sizeof(ifr));
-    strncpy(ifr.ifr_name, ifName.toStdString().c_str(), IFNAMSIZ - 1);
+    strncpy(ifr.ifr_name, device->interfaceName().toStdString().c_str(), IFNAMSIZ - 1);
     if (setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE, &ifr, sizeof(ifr)) < 0) {
         close(sock);
         return false;
     }
 
-    QList<QNetworkInterface> ifaces = QNetworkInterface::allInterfaces();
+    // 使用网卡自身的 IPv4 地址绑定源地址，确保从该网卡发出
     bool bound = false;
-    for (const QNetworkInterface &iface : ifaces) {
-        if (iface.name() != ifName)
-            continue;
-        for (const QNetworkAddressEntry &entry : iface.addressEntries()) {
-            if (entry.ip().protocol() != QAbstractSocket::IPv4Protocol)
-                continue;
-            sockaddr_in localAddr;
-            memset(&localAddr, 0, sizeof(localAddr));
-            localAddr.sin_family = AF_INET;
-            localAddr.sin_port = 0;
-            inet_pton(AF_INET, entry.ip().toString().toUtf8().constData(), &localAddr.sin_addr);
-            if (::bind(sock, (sockaddr *)&localAddr, sizeof(localAddr)) == 0)
-                bound = true;
+    NetworkManager::IpAddresses ipv4AddrList = device->ipV4Config().addresses();
+    for (const NetworkManager::IpAddress &ipAddr : ipv4AddrList) {
+        sockaddr_in localAddr{};
+        memset(&localAddr, 0, sizeof(localAddr));
+        localAddr.sin_family = AF_INET;
+        localAddr.sin_port = 0;
+        inet_pton(AF_INET, ipAddr.ip().toString().toUtf8().constData(), &localAddr.sin_addr);
+        if (::bind(sock, (sockaddr *)&localAddr, sizeof(localAddr)) == 0) {
+            bound = true;
             break;
         }
-        break;
     }
+
     if (!bound) {
         close(sock);
         return false;
     }
 
+    // 构造 DNS 服务器地址（端口 53）
     sockaddr_in dnsAddr;
     memset(&dnsAddr, 0, sizeof(dnsAddr));
     dnsAddr.sin_family = AF_INET;
@@ -360,33 +323,24 @@ bool NetworkCheckerByDomain::checkIpAddrByUDP(const QString& ifName, const QStri
         return false;
     }
 
-    // 构造DNS A记录查询包
-    unsigned char pkt[512] = {0};
-    unsigned short id = htons(0x7788);
-    memcpy(pkt, &id, 2);
-    pkt[2] = 0x01; pkt[3] = 0x00;
-    unsigned short qd = htons(1);
-    memcpy(pkt + 4, &qd, 2);
-    int ptr = 12;
-    QStringList seg = domain.split(".");
-    for (auto& s : seg) {
-        QByteArray buf = s.toUtf8();
-        pkt[ptr++] = static_cast<unsigned char>(buf.size());
-        memcpy(pkt + ptr, buf.data(), buf.size());
-        ptr += buf.size();
-    }
-    pkt[ptr++] = 0;
-    unsigned short typeA = htons(1), cls = htons(1);
-    memcpy(pkt + ptr, &typeA, 2); ptr += 2;
-    memcpy(pkt + ptr, &cls, 2); ptr += 2;
-
-    ssize_t sent = sendto(sock, pkt, ptr, MSG_NOSIGNAL, (sockaddr*)&dnsAddr, sizeof(dnsAddr));
-    if (sent < 0) {
-        qWarning() << "sendto failed for" << ifName << "dns:" << dnsIp << "errno:" << errno << strerror(errno);
+    // 构造并发送 DNS 查询包
+    unsigned short txId = static_cast<unsigned short>(QRandomGenerator::global()->generate() % 65536);
+    unsigned char pkt[512];
+    int pktLen = buildDnsQueryPacket(domain, pkt, sizeof(pkt), txId);
+    if (pktLen < 0) {
+        qWarning() << "DNS query packet too large for domain:" << domain;
         close(sock);
         return false;
     }
 
+    ssize_t sent = sendto(sock, pkt, pktLen, MSG_NOSIGNAL, (sockaddr*)&dnsAddr, sizeof(dnsAddr));
+    if (sent < 0) {
+        qWarning() << "sendto failed for" << device->interfaceName() << "dns:" << dnsIp << "errno:" << errno << strerror(errno);
+        close(sock);
+        return false;
+    }
+
+    // 等待响应并用 select 控制超时
     fd_set rfds;
     FD_ZERO(&rfds);
     FD_SET(sock, &rfds);
@@ -395,75 +349,149 @@ bool NetworkCheckerByDomain::checkIpAddrByUDP(const QString& ifName, const QStri
     tv.tv_usec = (curTimeout % 1000) * 1000;
 
     bool succ = false;
-    if (select(sock+1, &rfds, nullptr, nullptr, &tv) > 0) {
-        char buf[512];
-        ssize_t len = recv(sock, buf, sizeof(buf), 0);
-        if (len > 12) {
-            unsigned short respId;
-            memcpy(&respId, buf, 2);
-            respId = ntohs(respId);
-            if (respId == 0x7788 && (buf[2] & 0x80)) {
-                int p = 12;
-                unsigned short qnum;
-                memcpy(&qnum, buf + 4, 2);
-                qnum = ntohs(qnum);
+    if (select(sock + 1, &rfds, nullptr, nullptr, &tv) > 0) {
+        unsigned char respBuf[512];
+        sockaddr_in fromAddr{};
+        socklen_t fromLen = sizeof(fromAddr);
+        ssize_t rlen = recvfrom(sock, reinterpret_cast<char *>(respBuf), sizeof(respBuf), 0, (sockaddr *)&fromAddr, &fromLen);
+        if (rlen > 12 && fromAddr.sin_family == AF_INET && fromAddr.sin_addr.s_addr == dnsAddr.sin_addr.s_addr && fromAddr.sin_port == dnsAddr.sin_port) {
+            succ = parseDnsResponse(respBuf, static_cast<int>(rlen), txId, outIp);
+        } else if (rlen > 0) {
+            // 使用 inet_ntop 替代 inet_ntoa，线程安全
+            char addrBuf[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &fromAddr.sin_addr, addrBuf, sizeof(addrBuf));
+            qWarning() << "DNS response from unexpected source, discarded:" << addrBuf;
+        }
+    }
 
-                unsigned short anNum;
-                memcpy(&anNum, buf + 6, 2);
-                anNum = ntohs(anNum);
+    close(sock);
+    return succ;
+}
 
-                for (int i = 0; i < qnum; i++) {
-                    while (p < len && buf[p] != 0) {
-                        if ((buf[p] & 0xC0) == 0xC0) {
-                            if (p + 2 > len)
-                                goto skip_qtype_qclass;
-                            p += 2;
-                            goto skip_qtype_qclass;
+bool NetworkCheckerByDomain::checkIpAddrByTCP(const NetworkManager::Device::Ptr &device, const QString &dnsIp, const QString &domain, int curTimeout, in_addr &outIp) const
+{
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0)
+        return false;
+
+    // 绑定网卡设备
+    struct ifreq ifr{};
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, device->interfaceName().toStdString().c_str(), IFNAMSIZ - 1);
+    if (setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE, &ifr, sizeof(ifr)) < 0) {
+        close(sock);
+        return false;
+    }
+
+    // 使用网卡自身的 IPv4 地址绑定源地址
+    bool bound = false;
+    NetworkManager::IpAddresses ipv4AddrList = device->ipV4Config().addresses();
+    for (const NetworkManager::IpAddress &ipAddr : ipv4AddrList) {
+        sockaddr_in localAddr{};
+        memset(&localAddr, 0, sizeof(localAddr));
+        localAddr.sin_family = AF_INET;
+        localAddr.sin_port = 0;
+        inet_pton(AF_INET, ipAddr.ip().toString().toUtf8().constData(), &localAddr.sin_addr);
+        if (::bind(sock, (sockaddr *)&localAddr, sizeof(localAddr)) == 0) {
+            bound = true;
+            break;
+        }
+    }
+
+    if (!bound) {
+        close(sock);
+        return false;
+    }
+
+    // 构造 DNS 服务器地址（端口 53）
+    sockaddr_in dnsAddr;
+    memset(&dnsAddr, 0, sizeof(dnsAddr));
+    dnsAddr.sin_family = AF_INET;
+    dnsAddr.sin_port = htons(53);
+    if (inet_pton(AF_INET, dnsIp.toStdString().c_str(), &dnsAddr.sin_addr) <= 0) {
+        close(sock);
+        return false;
+    }
+
+    // 非阻塞连接 DNS 服务器，用 select 控制连接超时（最多 2 秒）
+    int flags = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+
+    int connectRet = ::connect(sock, (sockaddr*)&dnsAddr, sizeof(dnsAddr));
+    if (connectRet < 0 && errno != EINPROGRESS) {
+        close(sock);
+        return false;
+    }
+
+    fd_set wfds;
+    FD_ZERO(&wfds);
+    FD_SET(sock, &wfds);
+    int connectTimeout = qMin(curTimeout, 2000);
+    timeval connectTv;
+    connectTv.tv_sec = connectTimeout / 1000;
+    connectTv.tv_usec = (connectTimeout % 1000) * 1000;
+
+    bool succ = false;
+    int selRet = select(sock + 1, nullptr, &wfds, nullptr, &connectTv);
+    if (selRet > 0) {
+        int err = 0;
+        socklen_t errLen = sizeof(err);
+        getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &errLen);
+        if (err == 0) {
+            // 连接成功，构造 DNS 查询包并加上 TCP 2 字节长度前缀
+            unsigned short txId = static_cast<unsigned short>(QRandomGenerator::global()->generate() % 65536);
+            unsigned char pkt[512];
+            int pktLen = buildDnsQueryPacket(domain, pkt, sizeof(pkt), txId);
+            if (pktLen < 0) {
+                qWarning() << "DNS query packet too large for domain:" << domain;
+                close(sock);
+                return false;
+            }
+
+            // TCP DNS 消息格式：2 字节大端长度前缀 + DNS 报文内容
+            unsigned char tcpPkt[514];
+            unsigned short pktLenH = htons(pktLen);
+            memcpy(tcpPkt, &pktLenH, 2);
+            memcpy(tcpPkt + 2, pkt, pktLen);
+
+            ssize_t sent = send(sock, tcpPkt, pktLen + 2, MSG_NOSIGNAL);
+            if (sent == pktLen + 2) {
+                // 用 select 等待响应可读，然后在非阻塞模式下一次性读完缓冲区。
+                // 保持非阻塞模式的原因：如果对端返回非 DNS 数据（如手机热点拦截页面），
+                // 非阻塞 recv 会立即返回可读数据或 EAGAIN，不会像阻塞 MSG_WAITALL 那样死等垃圾数据
+                fd_set rfds;
+                FD_ZERO(&rfds);
+                FD_SET(sock, &rfds);
+                timeval recvTv;
+                recvTv.tv_sec = curTimeout / 1000;
+                recvTv.tv_usec = (curTimeout % 1000) * 1000;
+
+                if (select(sock + 1, &rfds, nullptr, nullptr, &recvTv) > 0) {
+                    unsigned char respBuf[514];
+                    // 非阻塞循环读取，EAGAIN 时自然退出
+                    ssize_t totalRecv = 0;
+                    while (totalRecv < 514) {
+                        ssize_t n = recv(sock, reinterpret_cast<char *>(respBuf + totalRecv), 514 - totalRecv, 0);
+                        if (n <= 0)
+                            break;
+                        totalRecv += n;
+                    }
+                    // 解析 TCP DNS 响应：前 2 字节为长度前缀，后面才是 DNS 报文
+                    int parseOff = 0;
+                    int parseLen = totalRecv;
+                    if (totalRecv > 2) {
+                        unsigned short hdrLen;
+                        memcpy(&hdrLen, respBuf, 2);
+                        hdrLen = ntohs(hdrLen);
+                        if (hdrLen > 12 && hdrLen < 4096) {
+                            parseOff = 2;
+                            // 取实际接收量和声明长度的较小值，防止越界
+                            parseLen = hdrLen < (totalRecv - 2) ? hdrLen : (totalRecv - 2);
                         }
-                        p += buf[p] + 1;
                     }
-                    if (p < len && buf[p] == 0)
-                        p++;
-                skip_qtype_qclass:
-                    if (p + 4 > len)
-                        break;
-                    p += 4;
-                }
-
-                for (int i = 0; i < anNum && p + 12 <= len; i++) {
-                    while (p < len && buf[p] != 0) {
-                        if ((buf[p] & 0xC0) == 0xC0) {
-                            if (p + 2 > len)
-                                goto skip_ttl_rdlen;
-                            p += 2;
-                            goto skip_ttl_rdlen;
-                        }
-                        p += buf[p] + 1;
+                    if (parseLen > 12) {
+                        succ = parseDnsResponse(respBuf + parseOff, parseLen, txId, outIp);
                     }
-                    if (p < len && buf[p] == 0)
-                        p++;
-                skip_ttl_rdlen:
-                    if (p + 10 > len)
-                        break;
-
-                    unsigned short rtype;
-                    memcpy(&rtype, buf + p, 2);
-                    rtype = ntohs(rtype);
-                    p += 8;
-
-                    unsigned short rdLen;
-                    memcpy(&rdLen, buf + p, 2);
-                    rdLen = ntohs(rdLen);
-                    p += 2;
-
-                    if (rtype == 1 && rdLen == 4 && p + 4 <= len) {
-                        memcpy(&outIp, buf + p, 4);
-                        succ = true;
-                        break;
-                    }
-                    if (p + rdLen > len)
-                        break;
-                    p += rdLen;
                 }
             }
         }
@@ -473,201 +501,131 @@ bool NetworkCheckerByDomain::checkIpAddrByUDP(const QString& ifName, const QStri
     return succ;
 }
 
-bool NetworkCheckerByDomain::checkIpAddrByTCP(const QString &ifName, const QString &dnsIp, const QString &domain, int curTimeout, in_addr &outIp) const
+int NetworkCheckerByDomain::buildDnsQueryPacket(const QString &domain, unsigned char *pkt, int pktSize, unsigned short txId) const
 {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0)
+    memset(pkt, 0, pktSize);
+    int needed = 12; // DNS 头部固定 12 字节
+
+    // 计算问段域名编码后所需的长度：每个标签为 1 字节长度 + 标签内容
+    QStringList seg = domain.split(".");
+    for (const auto &s : seg) {
+        QByteArray buf = s.toUtf8();
+        if (buf.size() > 63) // RFC 1035: 单个标签不超过 63 字节
+            return -1;
+        needed += 1 + buf.size();
+    }
+    needed += 1 + 4; // 域名结尾 null 字节 + QTYPE(2) + QCLASS(2)
+
+    if (needed > pktSize)
+        return -1;
+
+    // 填充 DNS 头部：ID、标准查询标志、QDCOUNT=1
+    unsigned short id = htons(txId);
+    memcpy(pkt, &id, 2);
+    pkt[2] = 0x01; pkt[3] = 0x00; // Flags: RD=1, 其余为 0（标准查询）
+    unsigned short qd = htons(1);
+    memcpy(pkt + 4, &qd, 2);
+
+    // 填充问段：将域名按 "." 分割，每段前加长度字节，以 null 字节结尾
+    int ptr = 12;
+    for (const auto &s : seg) {
+        QByteArray buf = s.toUtf8();
+        pkt[ptr++] = static_cast<unsigned char>(buf.size());
+        memcpy(pkt + ptr, buf.data(), buf.size());
+        ptr += buf.size();
+    }
+    pkt[ptr++] = 0; // 域名结束标记
+    // QTYPE=A(1), QCLASS=IN(1)
+    unsigned short typeA = htons(1), cls = htons(1);
+    memcpy(pkt + ptr, &typeA, 2); ptr += 2;
+    memcpy(pkt + ptr, &cls, 2); ptr += 2;
+
+    return ptr;
+}
+
+bool NetworkCheckerByDomain::parseDnsResponse(const unsigned char *buf, int len, unsigned short txId, in_addr &outIp) const
+{
+    if (len <= 12)
         return false;
 
-     struct ifreq ifr;
-     memset(&ifr, 0, sizeof(ifr));
-     strncpy(ifr.ifr_name, ifName.toStdString().c_str(), IFNAMSIZ - 1);
-     if (setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE, &ifr, sizeof(ifr)) < 0) {
-         close(sock);
-         return false;
-     }
+    // 校验响应 ID 和 QR 标志位（bit 15: 1=响应）
+    unsigned short respId;
+    memcpy(&respId, buf, 2);
+    respId = ntohs(respId);
+    if (respId != txId || !(buf[2] & 0x80))
+        return false;
 
-     QList<QNetworkInterface> ifaces = QNetworkInterface::allInterfaces();
-     bool bound = false;
-     for (const QNetworkInterface &iface : ifaces) {
-         if (iface.name() != ifName)
-             continue;
-         for (const QNetworkAddressEntry &entry : iface.addressEntries()) {
-             if (entry.ip().protocol() != QAbstractSocket::IPv4Protocol)
-                 continue;
-             sockaddr_in localAddr;
-             memset(&localAddr, 0, sizeof(localAddr));
-             localAddr.sin_family = AF_INET;
-             localAddr.sin_port = 0;
-             inet_pton(AF_INET, entry.ip().toString().toUtf8().constData(), &localAddr.sin_addr);
-             if (::bind(sock, (sockaddr *)&localAddr, sizeof(localAddr)) == 0)
-                 bound = true;
-             break;
-         }
-         break;
-     }
+    int p = 12; // 跳过 12 字节 DNS 头部
+    unsigned short qnum;
+    memcpy(&qnum, buf + 4, 2);
+    qnum = ntohs(qnum);
 
-     if (!bound) {
-         close(sock);
-         return false;
-     }
+    unsigned short anNum;
+    memcpy(&anNum, buf + 6, 2);
+    anNum = ntohs(anNum);
 
-     sockaddr_in dnsAddr;
-     memset(&dnsAddr, 0, sizeof(dnsAddr));
-     dnsAddr.sin_family = AF_INET;
-     dnsAddr.sin_port = htons(53);
-     if (inet_pton(AF_INET, dnsIp.toStdString().c_str(), &dnsAddr.sin_addr) <= 0) {
-         close(sock);
-         return false;
-     }
-
-     int flags = fcntl(sock, F_GETFL, 0);
-     fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-
-     int connectRet = ::connect(sock, (sockaddr*)&dnsAddr, sizeof(dnsAddr));
-     if (connectRet < 0 && errno != EINPROGRESS) {
-         close(sock);
-         return false;
-     }
-
-     fd_set wfds;
-     FD_ZERO(&wfds);
-     FD_SET(sock, &wfds);
-     int connectTimeout = qMin(curTimeout, 2000);
-     timeval connectTv;
-     connectTv.tv_sec = connectTimeout / 1000;
-     connectTv.tv_usec = (connectTimeout % 1000) * 1000;
-
-     bool succ = false;
-     int selRet = select(sock + 1, nullptr, &wfds, nullptr, &connectTv);
-     if (selRet > 0) {
-         int err = 0;
-         socklen_t errLen = sizeof(err);
-         getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &errLen);
-         if (err == 0) {
-             unsigned char pkt[512] = {0};
-             unsigned short id = htons(0x7788);
-             memcpy(pkt, &id, 2);
-             pkt[2] = 0x01; pkt[3] = 0x00;
-             unsigned short qd = htons(1);
-             memcpy(pkt + 4, &qd, 2);
-             int ptr = 12;
-             QStringList seg = domain.split(".");
-             for (auto& s : seg) {
-                 QByteArray buf = s.toUtf8();
-                 pkt[ptr++] = static_cast<unsigned char>(buf.size());
-                 memcpy(pkt + ptr, buf.data(), buf.size());
-                 ptr += buf.size();
-             }
-             pkt[ptr++] = 0;
-             unsigned short typeA = htons(1), cls = htons(1);
-             memcpy(pkt + ptr, &typeA, 2); ptr += 2;
-             memcpy(pkt + ptr, &cls, 2); ptr += 2;
-
-             unsigned char tcpPkt[514];
-             unsigned short pktLen = htons(ptr);
-             memcpy(tcpPkt, &pktLen, 2);
-             memcpy(tcpPkt + 2, pkt, ptr);
-
-             ssize_t sent = send(sock, tcpPkt, ptr + 2, MSG_NOSIGNAL);
-             if (sent == ptr + 2) {
-                 fd_set rfds;
-                 FD_ZERO(&rfds);
-                 FD_SET(sock, &rfds);
-                 timeval recvTv;
-                 recvTv.tv_sec = curTimeout / 1000;
-                 recvTv.tv_usec = (curTimeout % 1000) * 1000;
-
-                 if (select(sock + 1, &rfds, nullptr, nullptr, &recvTv) > 0) {
-                     char respBuf[514];
-                     ssize_t totalRecv = 0;
-                     while (totalRecv < 514) {
-                         ssize_t n = recv(sock, respBuf + totalRecv, 514 - totalRecv, 0);
-                         if (n <= 0)
-                             break;
-                         totalRecv += n;
-                     }
-                     int parseOff = 0;
-                     int parseLen = totalRecv;
-                     if (totalRecv > 2) {
-                         unsigned short hdrLen;
-                         memcpy(&hdrLen, respBuf, 2);
-                         hdrLen = ntohs(hdrLen);
-                         if (hdrLen > 12 && hdrLen < 4096) {
-                             parseOff = 2;
-                             parseLen = hdrLen < (totalRecv - 2) ? hdrLen : (totalRecv - 2);
-                         }
-                     }
-                     if (parseLen > 12) {
-                         int p = parseOff + 12;
-                         unsigned short qnum;
-                         memcpy(&qnum, respBuf + parseOff + 4, 2);
-                         qnum = ntohs(qnum);
-
-                         unsigned short anNum;
-                         memcpy(&anNum, respBuf + parseOff + 6, 2);
-                         anNum = ntohs(anNum);
-
-                         for (int i = 0; i < qnum; i++) {
-                             while (p < parseOff + parseLen && respBuf[p] != 0) {
-                                 if ((respBuf[p] & 0xC0) == 0xC0) {
-                                     if (p + 2 > parseOff + parseLen)
-                                         goto skip_qtype_qclass;
-                                     p += 2;
-                                     goto skip_qtype_qclass;
-                                 }
-                                 p += respBuf[p] + 1;
-                             }
-                             if (p < parseOff + parseLen && respBuf[p] == 0)
-                                 p++;
-                         skip_qtype_qclass:
-                             if (p + 4 > parseOff + parseLen)
-                                 break;
-                             p += 4;
-                         }
-
-                         for (int i = 0; i < anNum && p + 12 <= parseOff + parseLen; i++) {
-                             while (p < parseOff + parseLen && respBuf[p] != 0) {
-                                 if ((respBuf[p] & 0xC0) == 0xC0) {
-                                     if (p + 2 > parseOff + parseLen)
-                                         goto skip_ttl_rdlen;
-                                     p += 2;
-                                     goto skip_ttl_rdlen;
-                                 }
-                                 p += respBuf[p] + 1;
-                             }
-                             if (p < parseOff + parseLen && respBuf[p] == 0)
-                                 p++;
-                         skip_ttl_rdlen:
-                             if (p + 10 > parseOff + parseLen)
-                                 break;
-
-                             unsigned short rtype;
-                             memcpy(&rtype, respBuf + p, 2);
-                             rtype = ntohs(rtype);
-                             p += 8;
-
-                             unsigned short rdLen;
-                             memcpy(&rdLen, respBuf + p, 2);
-                             rdLen = ntohs(rdLen);
-                             p += 2;
-
-                             if (rtype == 1 && rdLen == 4 && p + 4 <= parseOff + parseLen) {
-                                 memcpy(&outIp, respBuf + p, 4);
-                                 succ = true;
-                             }
-                             if (p + rdLen > parseOff + parseLen)
-                                 break;
-                             p += rdLen;
-                             if (succ)
-                                 break;
-                         }
-                     }
-                 }
-             }
-         }
+    // 跳过 Question Section：每个问题包含域名 + QTYPE(2) + QCLASS(2)
+    for (int i = 0; i < qnum; i++) {
+        bool compressed = false;
+        // 跳过域名：逐标签跳过，遇到压缩指针（高两 bit 为 11）则跳过 2 字节
+        while (p < len && buf[p] != 0) {
+            if ((buf[p] & 0xC0) == 0xC0) {
+                if (p + 2 > len)
+                    break;
+                p += 2;
+                compressed = true;
+                break;
+            }
+            p += buf[p] + 1;
+        }
+        // 压缩指针后紧跟 TYPE 字段，没有 null 终止符，所以只在非压缩时跳过 null
+        if (!compressed && p < len && buf[p] == 0)
+            p++;
+        if (p + 4 > len)
+            break;
+        p += 4; // 跳过 QTYPE(2) + QCLASS(2)
     }
 
-    close(sock);
-    return succ;
+    // 遍历 Answer Section，查找 A 记录
+    for (int i = 0; i < anNum && p + 12 <= len; i++) {
+        bool compressed = false;
+        // 跳过 Answer 中的域名（可能使用压缩指针指向 Question 中的域名）
+        while (p < len && buf[p] != 0) {
+            if ((buf[p] & 0xC0) == 0xC0) {
+                if (p + 2 > len)
+                    break;
+                p += 2;
+                compressed = true;
+                break;
+            }
+            p += buf[p] + 1;
+        }
+        if (!compressed && p < len && buf[p] == 0)
+            p++;
+        // 剩余至少需要 10 字节：TYPE(2) + CLASS(2) + TTL(4) + RDLENGTH(2)
+        if (p + 10 > len)
+            break;
+
+        unsigned short rtype;
+        memcpy(&rtype, buf + p, 2);
+        rtype = ntohs(rtype);
+        p += 8; // 跳过 TYPE(2) + CLASS(2) + TTL(4)
+
+        unsigned short rdLen;
+        memcpy(&rdLen, buf + p, 2);
+        rdLen = ntohs(rdLen);
+        p += 2; // 跳过 RDLENGTH(2)
+
+        // 找到 A 记录：TYPE=1，RDATA 长度固定 4 字节（IPv4 地址）
+        if (rtype == 1 && rdLen == 4 && p + 4 <= len) {
+            memcpy(&outIp, buf + p, 4);
+            return true;
+        }
+        // 非 A 记录（如 CNAME、TXT 等），根据 RDLENGTH 跳过 RDATA
+        if (p + rdLen > len)
+            break;
+        p += rdLen;
+    }
+
+    return false;
 }
