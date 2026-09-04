@@ -5,12 +5,22 @@
 #include <fcntl.h>
 #include <netdb.h>
 
+#include <QElapsedTimer>
+#include <QUrl>
+
 #include <NetworkManagerQt/Manager>
 
 static const QStringList kTestHosts = {
     "http://www.baidu.com",
     "https://223.5.5.5",
 };
+
+namespace {
+// 探测结果：1=在线（TCP 可达，或 HTTP 校验通过），0=不可达，-1=检测到 portal 认证拦截页
+constexpr int kProbeUnreachable = 0;
+constexpr int kProbeOnline = 1;
+constexpr int kProbePortal = -1;
+}
 
 NetworkCheckerByDomain::NetworkCheckerByDomain(QObject *parent)
     : NetworkChecker(parent)
@@ -77,14 +87,21 @@ bool NetworkCheckerByDomain::checkIfInterfaceOnline(const QString &interfacename
             target.sin_family = AF_INET;
             target.sin_port = htons(port);
             target.sin_addr = addr;
-            if (isIfaceReachable(device->interfaceName(), target, curTimeout)) {
+            if (checkReachability(device->interfaceName(), target, QString(), curTimeout, false) == kProbeOnline) {
                 qDebug() << "interface " << device->interfaceName() << " test ip " << url << " ok";
                 return true;
             }
-        } else if (checkNetCardOnline(device, host, dnsList, curTimeout, port)) {
-            // 如果是域名，先通过指定网卡的 DNS 解析域名，再 TCP 连接解析出的 IP
-            qDebug() << "interface " << device->interfaceName() << " test url " << url << " ok";
-            return true;
+        } else {
+            // 如果是域名，先通过指定网卡的 DNS 解析域名，再 HTTP 验证（TCP 成功不一定能上网，portal 会拦截并返回认证页）
+            int httpRet = checkNetCardOnline(device, host, dnsList, curTimeout, port);
+            if (httpRet == kProbeOnline) {
+                qDebug() << "interface " << device->interfaceName() << " test url " << url << " ok";
+                return true;
+            }
+            if (httpRet == kProbePortal) {
+                qWarning() << "interface " << device->interfaceName() << " test url " << url << " needs portal authentication";
+                return false;
+            }
         }
     }
     // 兜底方案：直接 TCP 连接公共 DNS 的 80 端口，检测网卡是否有基本出口连通性（在一些网络结构中例如手机热点，可能屏蔽了53端口，通过DNS获取IP失败，这里就使用兜底方案）
@@ -103,7 +120,7 @@ bool NetworkCheckerByDomain::checkIfInterfaceOnline(const QString &interfacename
         target.sin_family = AF_INET;
         target.sin_port = htons(80);
         inet_pton(AF_INET, dns.toStdString().c_str(), &target.sin_addr);
-        if (isIfaceReachable(device->interfaceName(), target, curTimeout)) {
+        if (checkReachability(device->interfaceName(), target, QString(), curTimeout, false) == kProbeOnline) {
             qDebug() << "interface " << device->interfaceName() << "test dns " << dns << " ok";
             return true;
         }
@@ -132,11 +149,11 @@ QStringList NetworkCheckerByDomain::getDeviceDnsList(const NetworkManager::Devic
     return dnsList;
 }
 
-bool NetworkCheckerByDomain::isIfaceReachable(const QString &ifName, const sockaddr_in &dest, int timeoutMs) const
+int NetworkCheckerByDomain::checkReachability(const QString &ifName, const sockaddr_in &dest, const QString &host, int timeoutMs, bool httpCheck) const
 {
     int sockFd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockFd < 0)
-        return false;
+        return kProbeUnreachable;
 
     // 绑定网卡设备，所有流量从该网卡发出
     struct ifreq ifr{};
@@ -144,7 +161,7 @@ bool NetworkCheckerByDomain::isIfaceReachable(const QString &ifName, const socka
     strncpy(ifr.ifr_name, ifName.toStdString().c_str(), IFNAMSIZ - 1);
     if (setsockopt(sockFd, SOL_SOCKET, SO_BINDTODEVICE, &ifr, sizeof(ifr)) < 0) {
         close(sockFd);
-        return false;
+        return kProbeUnreachable;
     }
 
     // 设为非阻塞，用 select 控制连接超时
@@ -154,47 +171,152 @@ bool NetworkCheckerByDomain::isIfaceReachable(const QString &ifName, const socka
     int connectRet = ::connect(sockFd, (sockaddr*)&dest, sizeof(dest));
     if (connectRet < 0 && errno != EINPROGRESS) {
         close(sockFd);
-        return false;
+        return kProbeUnreachable;
     }
 
-    // 立即连接成功的情况
-    if (connectRet == 0) {
-        close(sockFd);
-        return true;
-    }
-
-    // 等待连接完成（非阻塞模式下 EINPROGRESS 需要通过 select 检测可写事件）
-    fd_set wfds{};
-    FD_ZERO(&wfds);
-    FD_SET(sockFd, &wfds);
-    timeval tv{};
-    tv.tv_sec = timeoutMs / 1000;
-    tv.tv_usec = (timeoutMs % 1000) * 1000;
-    int selRet = select(sockFd + 1, nullptr, &wfds, nullptr, &tv);
-    if (selRet > 0) {
+    if (connectRet != 0) {
+        // 等待连接完成（非阻塞模式下 EINPROGRESS 需要通过 select 检测可写事件）
+        fd_set wfds{};
+        FD_ZERO(&wfds);
+        FD_SET(sockFd, &wfds);
+        timeval tv{};
+        tv.tv_sec = timeoutMs / 1000;
+        tv.tv_usec = (timeoutMs % 1000) * 1000;
+        int selRet = select(sockFd + 1, nullptr, &wfds, nullptr, &tv);
+        if (selRet <= 0) {
+            close(sockFd);
+            return kProbeUnreachable;
+        }
         // 检查连接是否真正成功（select 可写不代表连接成功，需通过 SO_ERROR 确认）
         int err = 0;
         socklen_t errLen = sizeof(err);
         getsockopt(sockFd, SOL_SOCKET, SO_ERROR, &err, &errLen);
+        if (err != 0) {
+            close(sockFd);
+            return kProbeUnreachable;
+        }
+    }
+
+    // 纯 TCP 探测：三次握手成功即视为可达
+    if (!httpCheck) {
         close(sockFd);
-        return (err == 0);
+        return kProbeOnline;
+    }
+
+    // HTTP 探测：portal 会把任意 HTTP 请求透明拦截并返回认证页，仅靠 TCP 握手无法识别，
+    // 因此需要发 GET 并校验响应头/响应体。
+    QByteArray hostUtf8 = host.toUtf8();
+    QByteArray request = "GET / HTTP/1.1\r\n"
+                         "Host: " + hostUtf8 + "\r\n"
+                         "User-Agent: NetworkChecker/1.0\r\n"
+                         "Accept: */*\r\n"
+                         "Connection: close\r\n"
+                         "\r\n";
+    ssize_t sent = send(sockFd, request.constData(), request.size(), MSG_NOSIGNAL);
+    if (sent != static_cast<ssize_t>(request.size())) {
+        close(sockFd);
+        return kProbeUnreachable;
+    }
+
+    QElapsedTimer timer;
+    timer.start();
+    QByteArray response;
+    char buf[4096];
+    while (response.size() < 64 * 1024) {
+        int remainTimeout = timeoutMs - static_cast<int>(timer.elapsed());
+        if (remainTimeout <= 0)
+            break;
+
+        fd_set rfds{};
+        FD_ZERO(&rfds);
+        FD_SET(sockFd, &rfds);
+        timeval tv{};
+        tv.tv_sec = remainTimeout / 1000;
+        tv.tv_usec = (remainTimeout % 1000) * 1000;
+        int selRet = select(sockFd + 1, &rfds, nullptr, nullptr, &tv);
+        if (selRet <= 0)
+            break;
+
+        ssize_t n = recv(sockFd, buf, sizeof(buf), 0);
+        if (n <= 0) {
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                continue;
+            break; // n == 0 表示对端关闭连接
+        }
+        response.append(buf, static_cast<int>(n));
     }
     close(sockFd);
-    return false;
+
+    if (response.isEmpty())
+        return kProbeUnreachable;
+
+    // 分离响应头和响应体
+    int headerEnd = response.indexOf("\r\n\r\n");
+    QByteArray headerBlock = headerEnd >= 0 ? response.left(headerEnd) : response;
+    QByteArray bodyBlock = headerEnd >= 0 ? response.mid(headerEnd + 4) : QByteArray();
+
+    // 解析状态码
+    int statusLineEnd = headerBlock.indexOf("\r\n");
+    QByteArray statusLine = statusLineEnd >= 0 ? headerBlock.left(statusLineEnd) : headerBlock;
+    int code = 0;
+    int sp1 = statusLine.indexOf(' ');
+    if (sp1 >= 0) {
+        int sp2 = statusLine.indexOf(' ', sp1 + 1);
+        QByteArray codePart = sp2 >= 0 ? statusLine.mid(sp1 + 1, sp2 - sp1 - 1) : statusLine.mid(sp1 + 1);
+        code = codePart.toInt();
+    }
+    if (code == 0)
+        return kProbeUnreachable;
+
+    // 解析 Location 头，portal 通常会把请求重定向到认证服务器
+    QString location;
+    int locIdx = headerBlock.toLower().indexOf("location:");
+    if (locIdx >= 0) {
+        int valStart = headerBlock.indexOf(':', locIdx) + 1;
+        int valEnd = headerBlock.indexOf("\r\n", valStart);
+        if (valEnd < 0)
+            valEnd = headerBlock.size();
+        location = QString::fromLatin1(headerBlock.mid(valStart, valEnd - valStart).trimmed());
+    }
+
+    QUrl locationUrl(location);
+    QString locationHost = locationUrl.host();
+
+    // 关键判断：portal 会把任意请求重定向到认证服务器（不同主机），
+    // 而正常站点（如 http→https、加 www）的重定向通常仍在原主机上。
+    // 因此“Location 主机与原请求主机不同”即可判为 portal，不区分 2xx/3xx。
+    if (!locationHost.isEmpty() && locationHost.compare(host, Qt::CaseInsensitive) != 0) {
+        qWarning() << "interface " << ifName << " http check for " << host << " redirected to " << location;
+        return kProbePortal;
+    }
+
+    // portal 的 200 页面可能没有 Location 头，而是通过 meta refresh 跳转到认证页
+    QString lowerBody = QString::fromLatin1(bodyBlock).toLower();
+    bool portalMarker = lowerBody.contains("web authentication")
+                        || lowerBody.contains("meta http-equiv=\"refresh\"")
+                        || lowerBody.contains("portal.html")
+                        || lowerBody.contains("url=http");
+    if (portalMarker) {
+        qWarning() << "interface " << ifName << " http check for " << host << " detected portal page";
+        return kProbePortal;
+    }
+
+    qDebug() << "interface " << ifName << " http check for " << host << " ok, status " << code;
+    return kProbeOnline;
 }
 
-bool NetworkCheckerByDomain::checkNetCardOnline(const NetworkManager::Device::Ptr &device, const QString &domain, const QStringList &dnslist, int timeoutMs, int port) const
+int NetworkCheckerByDomain::checkNetCardOnline(const NetworkManager::Device::Ptr &device, const QString &domain, const QStringList &dnslist, int timeoutMs, int port) const
 {
     in_addr targetIp{};
     QElapsedTimer elapsed;
     elapsed.start();
     int halfTimeout = timeoutMs / 2;
     if (!resolveByBindIface(device, domain, dnslist, targetIp, halfTimeout))
-        return false;
+        return kProbeUnreachable;
 
     int remainTimeout = timeoutMs - static_cast<int>(elapsed.elapsed());
     if (remainTimeout <= 0)
-        return false;
+        return kProbeUnreachable;
 
     sockaddr_in dest{};
     memset(&dest, 0, sizeof(dest));
@@ -202,7 +324,8 @@ bool NetworkCheckerByDomain::checkNetCardOnline(const NetworkManager::Device::Pt
     dest.sin_port = htons(static_cast<quint16>(port));
     dest.sin_addr = targetIp;
 
-    return isIfaceReachable(device->interfaceName(), dest, remainTimeout);
+    const bool httpCheck = (port == 80);
+    return checkReachability(device->interfaceName(), dest, httpCheck ? domain : QString(), remainTimeout, httpCheck);
 }
 
 // 绑定指定网卡进行 DNS 解析，按优先级依次尝试三种方式：
