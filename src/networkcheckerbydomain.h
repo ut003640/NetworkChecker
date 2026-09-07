@@ -5,6 +5,8 @@
 
 #include <NetworkManagerQt/Device>
 
+enum class ProbeResult : int;
+
 class NetworkCheckerByDomain : public NetworkChecker
 {
     Q_OBJECT
@@ -17,8 +19,8 @@ protected:
 
 private:
     QStringList getDeviceDnsList(const NetworkManager::Device::Ptr &device) const;
-    int checkReachability(const QString &ifName, const sockaddr_in &dest, const QString &host, int timeoutMs, bool httpCheck) const;
-    int checkNetCardOnline(const NetworkManager::Device::Ptr &device, const QString &domain, const QStringList &dnslist, int timeoutMs, int port) const;
+    ProbeResult checkReachability(const QString &ifName, const sockaddr_in &dest, const QString &host, int timeoutMs, bool httpCheck) const;
+    ProbeResult checkNetCardOnline(const NetworkManager::Device::Ptr &device, const QString &domain, const QStringList &dnslist, int timeoutMs, int port) const;
     bool resolveByBindIface(const NetworkManager::Device::Ptr &device, const QString &domain, const QStringList &dnslist, in_addr &outIp, int timeout) const;
     bool checkIpAddrByUDP(const NetworkManager::Device::Ptr &device, const QString &dnsIp, const QString &domain, int curTimeout, in_addr &outIp) const;
     bool checkIpAddrByTCP(const NetworkManager::Device::Ptr &device, const QString &dnsIp, const QString &domain, int curTimeout, in_addr &outIp) const;
